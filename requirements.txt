@@ -4,3 +4,4 @@ pydantic
 numpy
 librosa
 scikit-learn
+python-multipart
