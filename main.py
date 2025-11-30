@@ -41,7 +41,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=helpers.STATIC_DIR), name="static")
 
 # include audio-related router (uploads, samples, lessons...)
-app.include_router(audio_router)
+app.include_router(audio_router, prefix="/api", tags=["Audio & Vocab"])
 
 
 def get_local_ip() -> Optional[str]:
@@ -65,9 +65,29 @@ def safe_filename(name: Optional[str]) -> str:
     return base.replace("..", "")
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize on startup"""
+    helpers.load_persisted_store()
+    helpers.logger.info("Server started successfully")
+
+
 @app.get("/")
 def read_root():
-    return {"message": "Server is running"}
+    return {
+        "message": "Vietnamese Pronunciation Learning API",
+        "docs": "/docs",
+        "health": "ok"
+    }
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "samples_count": len(helpers.PERSISTED_STORE.get("samples", {})),
+        "lessons_count": len(helpers.LESSONS)
+    }
 
 
 @app.get("/ping")
