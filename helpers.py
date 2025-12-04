@@ -7,6 +7,8 @@ from typing import Optional
 import librosa
 import numpy as np
 import logging
+import time
+from datetime import datetime
 
 # --- Configuration ---
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -57,8 +59,11 @@ VOCAB = {
 # persisted store (file-backed)
 PERSISTED_STORE = {"lessons": {}, "samples": {}}
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging with better format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 def load_persisted_store():
@@ -73,6 +78,12 @@ def load_persisted_store():
         for lesson in LESSONS:
             if lesson["id"] in progress_data:
                 lesson["progress"] = progress_data[lesson["id"]]
+        
+        # Ensure all required keys exist
+        PERSISTED_STORE.setdefault("lessons", {})
+        PERSISTED_STORE.setdefault("samples", {})
+        PERSISTED_STORE.setdefault("progress", {})
+        
     except FileNotFoundError:
         PERSISTED_STORE = {"lessons": {}, "samples": {}, "progress": {}}
         logger.warning("vocab_store.json not found, created new store")
@@ -123,14 +134,29 @@ def convert_to_wav16_mono(src_path: str, dst_path: str) -> None:
 
 def extract_features(path: str):
     try:
-        y, sr = librosa.load(path, sr=16000)
+        # Suppress librosa warnings
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            y, sr = librosa.load(path, sr=16000)
+        
         mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13), axis=1)
-        pitch, _ = librosa.piptrack(y=y, sr=sr)
-        positive_pitch = pitch[pitch > 0]
+        
+        # More robust pitch extraction
+        pitch, magnitude = librosa.piptrack(y=y, sr=sr)
+        pitch_values = pitch[magnitude > np.median(magnitude)]
+        positive_pitch = pitch_values[pitch_values > 0]
         pitch_mean = float(np.mean(positive_pitch)) if positive_pitch.size > 0 else 0.0
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        
+        # Safer tempo extraction
+        try:
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            tempo = float(tempo)
+        except Exception:
+            tempo = 120.0  # Default BPM if extraction fails
+        
         logger.info(f"Extracted features from {path}")
-        return {"mfcc": mfcc.tolist(), "pitch": pitch_mean, "tempo": float(tempo)}
+        return {"mfcc": mfcc.tolist(), "pitch": pitch_mean, "tempo": tempo}
     except Exception as e:
         logger.error(f"Feature extraction failed for {path}: {e}")
         raise
@@ -207,6 +233,14 @@ def rescan_samples():
     except Exception as e:
         logger.error(f"Rescan failed: {e}")
         raise
+
+def _get_timestamp() -> str:
+    """Get current timestamp as ISO string"""
+    return datetime.now().isoformat()
+
+def _timestamp_to_str(timestamp: float) -> str:
+    """Convert Unix timestamp to ISO string"""
+    return datetime.fromtimestamp(timestamp).isoformat()
 
 # Multimodal helpers are provided in a separate module helpers_multimodal.py.
 # Attempt relative import first, fall back to top-level import, else set to None.

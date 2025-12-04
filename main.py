@@ -26,22 +26,27 @@ from . import helpers
 from .audio_api import router as audio_router
 
 # --- minimal app setup (CORS, static) ---
-app = FastAPI(title="Speech Practice API (Split: main=compare, audio_api=uploads)")
+app = FastAPI(
+    title="Vietnamese Pronunciation Learning API",
+    description="API for Vietnamese pronunciation practice with audio comparison",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change in production
+    allow_origins=["*"],  # Configure in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# serve static files (audio + client static html)
-# helpers.STATIC_DIR should exist; this mounts the directory at /static
-app.mount("/static", StaticFiles(directory=helpers.STATIC_DIR), name="static")
-
 # include audio-related router (uploads, samples, lessons...)
 app.include_router(audio_router, prefix="/api", tags=["Audio & Vocab"])
+
+# serve static files (audio + client static html)
+# helpers.STATIC_DIR should exist; this mounts the directory at /static
+if os.path.exists(helpers.SAMPLES_DIR):
+    app.mount("/static/samples", StaticFiles(directory=helpers.SAMPLES_DIR), name="samples")
 
 
 def get_local_ip() -> Optional[str]:
