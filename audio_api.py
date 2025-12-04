@@ -150,7 +150,7 @@ async def api_import_package(file: UploadFile = File(...)):
 	temp_zip = os.path.join(helpers.TMP_DIR, f"import_{uuid.uuid4().hex[:8]}.zip")
 	with open(temp_zip, "wb") as f:
 		f.write(contents)
-	extract_dir = os.path.join(helpers.TMP_DIR, f"extract_{uuid.uuid4().hex[:8}")
+	extract_dir = os.path.join(helpers.TMP_DIR, f"extract_{uuid.uuid4().hex[:8]}")
 	os.makedirs(extract_dir, exist_ok=True)
 	try:
 		with zipfile.ZipFile(temp_zip, 'r') as z:

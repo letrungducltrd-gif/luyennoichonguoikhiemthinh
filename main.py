@@ -14,7 +14,6 @@ import json
 # removed unused: import re, import zipfile, import shutil
 import time
 from typing import Optional, Dict, Any
-# removed unused: from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -32,12 +31,21 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# CORS middleware with proper headers for audio streaming
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Configure in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Range",
+        "Accept-Ranges",
+        "Content-Length",
+        "Content-Type",
+        "ETag",
+        "Cache-Control"
+    ]
 )
 
 # include audio-related router (uploads, samples, lessons...)
