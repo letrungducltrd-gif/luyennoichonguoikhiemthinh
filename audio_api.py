@@ -1,15 +1,21 @@
-from fastapi import APIRouter, File, UploadFile, Form, HTTPException
-from starlette.responses import StreamingResponse
+from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Request
+from fastapi.responses import StreamingResponse, FileResponse, Response, JSONResponse
 from typing import Optional
+from pathlib import Path
 import os
 import uuid
 import zipfile
 import shutil
+import mimetypes
+import re
 
 from . import helpers
 from pydantic import BaseModel, validator
 
 router = APIRouter()
+
+# Constants for streaming
+CHUNK_SIZE = 1024 * 1024  # 1MB
 
 class VocabItemIn(BaseModel):
 	id: Optional[str] = None
@@ -24,6 +30,25 @@ class VocabItemIn(BaseModel):
 		if not v or not v.strip():
 			raise ValueError('Word cannot be empty')
 		return v.strip()
+
+# Helper functions for audio streaming
+def get_mime_type(path: Path) -> str:
+	"""Get MIME type for file"""
+	mt, _ = mimetypes.guess_type(str(path))
+	return mt or "application/octet-stream"
+
+def safe_resolve_filename(filename: str) -> Path:
+	"""Safely resolve filename and prevent path traversal"""
+	if "/" in filename or "\\" in filename or ".." in filename:
+		raise HTTPException(status_code=400, detail="Invalid filename")
+	
+	file_path = (Path(helpers.SAMPLES_DIR) / filename).resolve()
+	samples_dir = Path(helpers.SAMPLES_DIR).resolve()
+	
+	if not str(file_path).startswith(str(samples_dir)):
+		raise HTTPException(status_code=400, detail="Invalid file path")
+	
+	return file_path
 
 # -------------------------
 # API: lessons & vocab
@@ -499,7 +524,6 @@ def _get_vocab_info(sample_id: str, meta: dict) -> dict:
 	
 	# Fallback: try to extract from filename
 	filename = meta.get("filename", "")
-	import re
 	m = re.match(r'^\d+[-_](.+)\.wav$', filename)
 	if m:
 		word_part = m.group(1)
@@ -509,24 +533,210 @@ def _get_vocab_info(sample_id: str, meta: dict) -> dict:
 	return {"word": meta.get("original_name", filename), "meaning": ""}
 
 # -------------------------
+# API: Secure audio streaming with Range support
+# -------------------------
+@router.get("/audio/list", summary="List all available audio files")
+def api_list_audio():
+	"""
+	Get list of all audio files in samples directory.
+	Returns filename, size, and MIME type for each file.
+	"""
+	files = []
+	samples_path = Path(helpers.SAMPLES_DIR)
+	
+	if not samples_path.exists():
+		return {"files": [], "count": 0}
+	
+	for p in samples_path.iterdir():
+		if p.is_file():
+			_, ext = os.path.splitext(p.name)
+			if ext.lower() in helpers.ALLOWED_EXTS:
+				files.append({
+					"name": p.name,
+					"size": p.stat().st_size,
+					"mime": get_mime_type(p),
+					"stream_url": f"/api/audio/stream/{p.name}",
+					"download_url": f"/api/audio/download/{p.name}"
+				})
+	
+	return {"files": files, "count": len(files)}
+
+@router.get("/audio/stream/{filename}", summary="Stream audio file with Range support")
+async def api_stream_audio(request: Request, filename: str):
+	"""
+	Stream audio file with full Range request support for seeking.
+	Supports ETag caching and partial content (206).
+	"""
+	file_path = safe_resolve_filename(filename)
+	
+	if not file_path.exists() or not file_path.is_file():
+		raise HTTPException(status_code=404, detail="File not found")
+	
+	# Validate file type
+	_, ext = os.path.splitext(filename)
+	if ext.lower() not in helpers.ALLOWED_EXTS:
+		raise HTTPException(status_code=400, detail="File type not allowed")
+	
+	file_size = file_path.stat().st_size
+	content_type = get_mime_type(file_path)
+	
+	# Generate ETag
+	etag = f'W/"{file_path.stat().st_mtime_ns:x}-{file_path.stat().st_size:x}"'
+	
+	# Check If-None-Match for 304
+	if_none_match = request.headers.get("if-none-match")
+	if if_none_match and if_none_match == etag:
+		return JSONResponse(status_code=304, content=None)
+	
+	range_header = request.headers.get("range")
+	
+	# No Range header → return full file
+	if not range_header:
+		headers = {
+			"ETag": etag,
+			"Accept-Ranges": "bytes",
+			"Content-Length": str(file_size),
+			"Cache-Control": "public, max-age=3600",
+			"Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, ETag"
+		}
+		return FileResponse(
+			path=str(file_path),
+			media_type=content_type,
+			filename=file_path.name,
+			headers=headers
+		)
+	
+	# Parse Range header
+	try:
+		range_value = range_header.strip().lower()
+		assert range_value.startswith("bytes=")
+		r = range_value.split("=", 1)[1]
+		start_s, end_s = r.split("-", 1)
+		start = int(start_s) if start_s else 0
+		end = int(end_s) if end_s else file_size - 1
+	except Exception as e:
+		helpers.logger.warning(f"Invalid Range header: {range_header}, error: {e}")
+		headers = {
+			"ETag": etag,
+			"Accept-Ranges": "bytes",
+			"Content-Length": str(file_size)
+		}
+		return FileResponse(
+			path=str(file_path),
+			media_type=content_type,
+			filename=file_path.name,
+			headers=headers
+		)
+	
+	# Validate range
+	if start >= file_size:
+		raise HTTPException(
+			status_code=416,
+			detail="Requested Range Not Satisfiable",
+			headers={"Content-Range": f"bytes */{file_size}"}
+		)
+	
+	end = min(end, file_size - 1)
+	length = end - start + 1
+	
+	# Stream generator
+	def iter_file(path: Path, start_pos: int, content_length: int):
+		with open(path, "rb") as f:
+			f.seek(start_pos)
+			remaining = content_length
+			while remaining > 0:
+				chunk_size = min(CHUNK_SIZE, remaining)
+				chunk = f.read(chunk_size)
+				if not chunk:
+					break
+				remaining -= len(chunk)
+				yield chunk
+	
+	headers = {
+		"Content-Range": f"bytes {start}-{end}/{file_size}",
+		"Accept-Ranges": "bytes",
+		"Content-Length": str(length),
+		"ETag": etag,
+		"Cache-Control": "public, max-age=3600",
+		"Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, ETag"
+	}
+	
+	return StreamingResponse(
+		iter_file(file_path, start, length),
+		status_code=206,
+		media_type=content_type,
+		headers=headers
+	)
+
+@router.head("/audio/stream/{filename}", summary="Get audio metadata (HEAD)")
+async def api_stream_audio_head(filename: str):
+	"""HEAD request for audio metadata without downloading."""
+	file_path = safe_resolve_filename(filename)
+	
+	if not file_path.exists() or not file_path.is_file():
+		raise HTTPException(status_code=404, detail="File not found")
+	
+	_, ext = os.path.splitext(filename)
+	if ext.lower() not in helpers.ALLOWED_EXTS:
+		raise HTTPException(status_code=400, detail="File type not allowed")
+	
+	file_size = file_path.stat().st_size
+	content_type = get_mime_type(file_path)
+	etag = f'W/"{file_path.stat().st_mtime_ns:x}-{file_path.stat().st_size:x}"'
+	
+	headers = {
+		"Content-Type": content_type,
+		"Content-Length": str(file_size),
+		"Accept-Ranges": "bytes",
+		"ETag": etag,
+		"Cache-Control": "public, max-age=3600"
+	}
+	
+	return Response(status_code=200, headers=headers)
+
+@router.get("/audio/download/{filename}", summary="Download audio file (force download)")
+async def api_download_audio(filename: str):
+	"""Force download (triggers browser download dialog)."""
+	file_path = safe_resolve_filename(filename)
+	
+	if not file_path.exists() or not file_path.is_file():
+		raise HTTPException(status_code=404, detail="File not found")
+	
+	_, ext = os.path.splitext(filename)
+	if ext.lower() not in helpers.ALLOWED_EXTS:
+		raise HTTPException(status_code=400, detail="File type not allowed")
+	
+	content_type = get_mime_type(file_path)
+	
+	return FileResponse(
+		path=str(file_path),
+		media_type=content_type,
+		filename=filename,
+		headers={
+			"Content-Disposition": f'attachment; filename="{filename}"',
+			"Cache-Control": "public, max-age=3600"
+		}
+	)
+
+# -------------------------
 # API: Data sync for mobile app
 # -------------------------
-@router.get("/sync/lessons", summary="Get all lessons with full vocab data for offline use")
+@router.get("/sync/lessons", summary="Get all lessons with vocab for offline sync")
 def api_sync_lessons():
-	"""
-	Get complete lesson data including vocab and audio URLs.
-	Mobile app can use this to sync all learning materials.
-	"""
+	"""Get complete lesson data with audio URLs for mobile app sync."""
 	helpers.load_persisted_store()
 	
 	lessons_data = []
 	for lesson in helpers.LESSONS:
 		lesson_id = lesson["id"]
-		
-		# Get all vocab for this lesson (built-in + persisted)
 		vocab_list = helpers.merged_vocab_for_lesson(lesson_id)
 		
-		# Get progress from persisted store
+		# Update URLs to use streaming endpoint
+		for vocab in vocab_list:
+			if vocab.get("audio_filename"):
+				vocab["audio_url"] = f"/api/audio/stream/{vocab['audio_filename']}"
+				vocab["download_url"] = f"/api/audio/download/{vocab['audio_filename']}"
+		
 		progress = helpers.PERSISTED_STORE.get("progress", {}).get(lesson_id, lesson.get("progress", 0))
 		
 		lessons_data.append({
@@ -545,12 +755,9 @@ def api_sync_lessons():
 		"sync_timestamp": helpers._get_timestamp()
 	}
 
-@router.get("/sync/lesson/{lesson_id}", summary="Get single lesson with vocab for offline use")
+@router.get("/sync/lesson/{lesson_id}", summary="Get single lesson data")
 def api_sync_single_lesson(lesson_id: str):
-	"""
-	Get complete data for a single lesson.
-	"""
-	# Find lesson
+	"""Get complete data for a single lesson."""
 	lesson = None
 	for l in helpers.LESSONS:
 		if l["id"] == lesson_id:
@@ -562,6 +769,13 @@ def api_sync_single_lesson(lesson_id: str):
 	
 	helpers.load_persisted_store()
 	vocab_list = helpers.merged_vocab_for_lesson(lesson_id)
+	
+	# Update URLs
+	for vocab in vocab_list:
+		if vocab.get("audio_filename"):
+			vocab["audio_url"] = f"/api/audio/stream/{vocab['audio_filename']}"
+			vocab["download_url"] = f"/api/audio/download/{vocab['audio_filename']}"
+	
 	progress = helpers.PERSISTED_STORE.get("progress", {}).get(lesson_id, lesson.get("progress", 0))
 	
 	return {
@@ -577,49 +791,21 @@ def api_sync_single_lesson(lesson_id: str):
 		"sync_timestamp": helpers._get_timestamp()
 	}
 
-@router.get("/sync/audio/{filename}", summary="Download audio file by filename")
-def api_sync_audio(filename: str):
-	"""
-	Download a specific audio file.
-	Mobile app can download audio files on-demand or batch download.
-	"""
-	# Validate filename (prevent directory traversal)
-	if ".." in filename or "/" in filename or "\\" in filename:
-		raise HTTPException(status_code=400, detail="Invalid filename")
-	
-	file_path = os.path.join(helpers.SAMPLES_DIR, filename)
-	
-	if not os.path.exists(file_path):
-		raise HTTPException(status_code=404, detail=f"Audio file not found: {filename}")
-	
-	return StreamingResponse(
-		open(file_path, "rb"),
-		media_type="audio/wav",
-		headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-	)
-
 @router.post("/sync/download-batch", summary="Download multiple audio files as ZIP")
-async def api_sync_download_batch(
-	filenames: list[str] = Form(..., description="List of filenames to download")
-):
-	"""
-	Download multiple audio files in a single ZIP.
-	Request body: {"filenames": ["file1.wav", "file2.wav"]}
-	"""
+async def api_sync_download_batch(filenames: list[str] = Form(...)):
+	"""Download multiple audio files in a single ZIP."""
 	if not filenames or len(filenames) == 0:
 		raise HTTPException(status_code=400, detail="No filenames provided")
 	
 	if len(filenames) > 100:
 		raise HTTPException(status_code=400, detail="Maximum 100 files per batch")
 	
-	# Create temp ZIP
 	os.makedirs(helpers.TMP_DIR, exist_ok=True)
 	zip_name = f"batch_{uuid.uuid4().hex[:8]}.zip"
 	zip_path = os.path.join(helpers.TMP_DIR, zip_name)
 	
 	with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
 		for filename in filenames:
-			# Validate filename
 			if ".." in filename or "/" in filename or "\\" in filename:
 				continue
 			
@@ -644,17 +830,11 @@ async def api_sync_download_batch(
 	headers = {"Content-Disposition": f'attachment; filename="{zip_name}"'}
 	return StreamingResponse(iterfile(), media_type="application/zip", headers=headers)
 
-@router.get("/sync/check-updates", summary="Check if there are updates on server")
-def api_sync_check_updates(
-	last_sync: Optional[str] = None
-):
-	"""
-	Check if server has updates since last sync.
-	Mobile app can call this periodically to check for new content.
-	"""
+@router.get("/sync/check-updates", summary="Check for server updates")
+def api_sync_check_updates(last_sync: Optional[str] = None):
+	"""Check if server has updates since last sync timestamp."""
 	helpers.load_persisted_store()
 	
-	# Get modification time of vocab_store.json
 	try:
 		vocab_mtime = os.path.getmtime(helpers.VOCAB_STORE_FILE)
 		server_timestamp = helpers._timestamp_to_str(vocab_mtime)
@@ -674,15 +854,11 @@ def api_sync_check_updates(
 		"total_vocab": sum(len(helpers.merged_vocab_for_lesson(l["id"])) for l in helpers.LESSONS)
 	}
 
-@router.get("/sync/manifest", summary="Get complete data manifest for app")
+@router.get("/sync/manifest", summary="Get complete data manifest")
 def api_sync_manifest():
-	"""
-	Get complete manifest of all available data.
-	App can use this to determine what to download.
-	"""
+	"""Get manifest of all available data for app sync planning."""
 	helpers.load_persisted_store()
 	
-	# Build lesson manifest
 	lessons_manifest = []
 	for lesson in helpers.LESSONS:
 		lesson_id = lesson["id"]
@@ -693,7 +869,8 @@ def api_sync_manifest():
 			if vocab.get("audio_filename"):
 				audio_files.append({
 					"filename": vocab["audio_filename"],
-					"url": vocab.get("audio_url"),
+					"stream_url": f"/api/audio/stream/{vocab['audio_filename']}",
+					"download_url": f"/api/audio/download/{vocab['audio_filename']}",
 					"word": vocab.get("word")
 				})
 		
@@ -704,7 +881,6 @@ def api_sync_manifest():
 			"audio_files": audio_files
 		})
 	
-	# All available audio files
 	all_audio = []
 	if os.path.exists(helpers.SAMPLES_DIR):
 		for fn in os.listdir(helpers.SAMPLES_DIR):
@@ -713,8 +889,8 @@ def api_sync_manifest():
 				if ext.lower() in helpers.ALLOWED_EXTS:
 					all_audio.append({
 						"filename": fn,
-						"url": f"/static/samples/{fn}",
-						"download_url": f"/api/sync/audio/{fn}"
+						"stream_url": f"/api/audio/stream/{fn}",
+						"download_url": f"/api/audio/download/{fn}"
 					})
 	
 	return {

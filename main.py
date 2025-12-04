@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 import os
 import socket
-# ...existing code...
-# removed unused: import helpers_multimodal as mm
-# optional multimodal import (will be None if module absent)
-try:
-    import helpers_multimodal as mm  # noqa: F401
-except ImportError:
-    mm = None
 import subprocess
 import uuid
 import json
-# removed unused: import re, import zipfile, import shutil
 import time
 from typing import Optional, Dict, Any
+from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,7 +18,7 @@ import uvicorn
 from . import helpers
 from .audio_api import router as audio_router
 
-# --- minimal app setup (CORS, static) ---
+# --- FastAPI app setup ---
 app = FastAPI(
     title="Vietnamese Pronunciation Learning API",
     description="API for Vietnamese pronunciation practice with audio comparison",
@@ -51,10 +45,17 @@ app.add_middleware(
 # include audio-related router (uploads, samples, lessons...)
 app.include_router(audio_router, prefix="/api", tags=["Audio & Vocab"])
 
-# serve static files (audio + client static html)
-# helpers.STATIC_DIR should exist; this mounts the directory at /static
+# Serve static files for HTML/CSS/JS frontend
+STATIC_DIR = Path("static").resolve()
+if not STATIC_DIR.exists():
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+# Mount static directory (for frontend assets)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Serve audio samples (legacy support)
 if os.path.exists(helpers.SAMPLES_DIR):
-    app.mount("/static/samples", StaticFiles(directory=helpers.SAMPLES_DIR), name="samples")
+    app.mount("/samples", StaticFiles(directory=helpers.SAMPLES_DIR), name="samples")
 
 
 def get_local_ip() -> Optional[str]:
@@ -86,12 +87,18 @@ async def startup_event():
 
 
 @app.get("/")
-def read_root():
-    return {
-        "message": "Vietnamese Pronunciation Learning API",
-        "docs": "/docs",
-        "health": "ok"
-    }
+def index():
+    """Serve index.html at root for easy access"""
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.exists():
+        # Return API info if no index.html
+        return {
+            "message": "Vietnamese Pronunciation Learning API",
+            "docs": "/docs",
+            "health": "/health",
+            "note": "Put index.html in static/ folder to serve frontend"
+        }
+    return FileResponse(str(index_path), media_type="text/html")
 
 
 @app.get("/health")
@@ -113,7 +120,7 @@ def whoami():
     return {"ip": get_local_ip(), "port": 8000}
 
 
-# perform initial load + rescan at startup (delegated to helpers)
+# perform initial load + rescan at startup
 helpers.load_persisted_store()
 try:
     startup_report = helpers.rescan_samples()
@@ -286,7 +293,7 @@ async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile]
 # Mouth analysis endpoint (MediaPipe client will POST here)
 # -------------------------
 
-# Create log dir (prefer helpers.LOG_DIR if provided)
+# Create log dir
 LOG_DIR = getattr(helpers, "LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -295,7 +302,6 @@ class MouthPayload(BaseModel):
     features: Dict[str, Any]
     meta: Dict[str, Any] = {}
 
-# simple threshold — tune to your camera / geometry
 MAR_SPEAK_THRESHOLD = 0.18
 
 def analyze_features(features: Dict[str, Any]) -> Dict[str, Any]:
@@ -313,19 +319,16 @@ def analyze_features(features: Dict[str, Any]) -> Dict[str, Any]:
     else:
         result["likely_speaking"] = False
         result["note"] = "Mouth small/closed."
-    # Additional heuristics could be added here
     return result
 
 @app.post("/analyze-mouth")
 async def analyze_mouth(payload: MouthPayload, request: Request):
     rec = {"received_at": time.time(), "payload": payload.dict(), "client": request.client.host if request.client else None}
-    # log to file (append as ndjson)
     fname = os.path.join(LOG_DIR, f"mouthlog_{time.strftime('%Y%m%d')}.ndjson")
     try:
         with open(fname, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
-        # don't fail request just because of logging
         print("Failed to write mouth log:", e)
     features = payload.features or {}
     analysis = analyze_features(features)
@@ -333,4 +336,4 @@ async def analyze_mouth(payload: MouthPayload, request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    uvicorn.run("fastapi_server.main:app", host="0.0.0.0", port=8000, reload=True)
